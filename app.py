@@ -4,7 +4,9 @@ import time
 from app import App
 from app_components import clear_background
 from events.input import Buttons, BUTTON_TYPES
+from system.eventbus import eventbus
 from system.hexpansion.config import HexpansionConfig
+from system.scheduler.events import RequestStopAppEvent
 from machine import I2C
 
 # The KeebDeck hexpansion uses a TCA8418 keypad matrix controller.
@@ -165,6 +167,12 @@ class USBKeyboardApp(App):
         self._down = {}
         self._fn = False
         self._last_scan = 0
+        self._dirty = False
+        self._exiting = False
+        # The scheduler runs no cleanup hook when it stops an app, and the OS
+        # can stop us without going through our CANCEL handler. The pin IRQ
+        # outlives the app, so listen for our own stop to always release it.
+        eventbus.on(RequestStopAppEvent, self._on_stop_event, self)
         if config is not None:
             self._attach(config)
 
@@ -188,6 +196,13 @@ class USBKeyboardApp(App):
             i2c.writeto_mem(TCA8418_ADDR, _REG_KP_GPIO2, b"\xff")  # COL7:0 -> matrix
             i2c.writeto_mem(TCA8418_ADDR, _REG_KP_GPIO3, b"\x03")  # COL9:8 -> matrix
             i2c.writeto_mem(TCA8418_ADDR, _REG_CFG, b"\x91")  # KE_IEN | INT_CFG | AI
+            # The TCA8418 keeps latching key events (and asserting INT) even
+            # with no driver attached, and it isn't reset by a badge reboot.
+            # Discard anything stale: while the FIFO is non-empty, INT stays
+            # low and can never produce the falling edge our IRQ triggers on.
+            for _ in range(16):
+                if not i2c.readfrom_mem(TCA8418_ADDR, _REG_KEY_EVENT_A, 1)[0]:
+                    break
             i2c.writeto_mem(TCA8418_ADDR, _REG_INT_STAT, b"\x01")  # clear K_INT
         except OSError:
             self.config = None
@@ -205,21 +220,35 @@ class USBKeyboardApp(App):
         irq_pin.init(irq_pin.IN, irq_pin.PULL_UP)
         irq_pin.irq(self._handle_irq, irq_pin.IRQ_FALLING)
         self.status = "port {}".format(config.port)
+        if irq_pin.value() == 0:
+            # INT already asserted (event arrived between the drain above and
+            # arming): there will be no falling edge, so service it now.
+            self._handle_irq(irq_pin)
 
     def _detach(self):
         if self.config is not None:
             try:
-                self.config.pin[2].irq()
+                # Note: irq() with NO arguments is a getter and disarms
+                # nothing; handler=None must be passed explicitly.
+                self.config.pin[2].irq(handler=None)
             except (OSError, ValueError):
                 pass
+            try:
+                # Stop the TCA8418 raising interrupts while no driver is
+                # listening (any next driver rewrites CFG on its own attach).
+                self.config.i2c.writeto_mem(TCA8418_ADDR, _REG_CFG, b"\x00")
+                self.config.i2c.writeto_mem(TCA8418_ADDR, _REG_INT_STAT, b"\x01")
+            except (OSError, AttributeError):
+                pass
         self.config = None
+        self._last_scan = time.ticks_ms()
         self._down.clear()
         self._fn = False
-        if self.kbd is not None:
-            try:
-                self.kbd.send_keys((), 10)
-            except Exception:
-                pass
+        # Release all keys on the host. This may be the last report we ever
+        # send (e.g. on exit), so retry rather than dropping it silently.
+        for _ in range(3):
+            if self._send_state(100):
+                break
         self.status = "keyboard removed"
 
     # --- key handling ----------------------------------------------------
@@ -227,11 +256,17 @@ class USBKeyboardApp(App):
     def _handle_irq(self, _):
         try:
             i2c = self.config.i2c
-            count = i2c.readfrom_mem(TCA8418_ADDR, _REG_KEY_LCK_EC, 1)[0] & 0x0F
-            for _n in range(count):
+            while True:
                 event = i2c.readfrom_mem(TCA8418_ADDR, _REG_KEY_EVENT_A, 1)[0]
-                self._handle_key(event & 0x7F, bool(event & 0x80))
-            i2c.writeto_mem(TCA8418_ADDR, _REG_INT_STAT, b"\x01")  # clear K_INT
+                if event:
+                    self._handle_key(event & 0x7F, bool(event & 0x80))
+                    continue
+                i2c.writeto_mem(TCA8418_ADDR, _REG_INT_STAT, b"\x01")  # clear K_INT
+                # An event landing between the drain and the clear leaves INT
+                # asserted with no new falling edge, so it would never be
+                # delivered: check the FIFO again after clearing.
+                if not (i2c.readfrom_mem(TCA8418_ADDR, _REG_KEY_LCK_EC, 1)[0] & 0x0F):
+                    return
         except (OSError, AttributeError):
             self._detach()
 
@@ -252,22 +287,47 @@ class USBKeyboardApp(App):
             # sent, even if FN changed state in between.
             if self._down.pop(key, None) is None:
                 return
+        self._send_state()
+
+    def _send_state(self, timeout_ms=20):
+        # Send the current key state to the host. On failure (endpoint busy,
+        # USB not mounted) leave _dirty set so update()/background_update()
+        # retries; a dropped release would otherwise stick a key forever.
+        if self.kbd is None:
+            return True
         try:
-            self.kbd.send_keys(self._down.values(), 20)
+            self._dirty = not self.kbd.send_keys(self._down.values(), timeout_ms)
         except Exception:
-            pass
+            self._dirty = True
+        return not self._dirty
 
     # --- app lifecycle ---------------------------------------------------
+
+    def _on_stop_event(self, event):
+        if event.app is self:
+            self._exiting = True
+            self._detach()
 
     def update(self, delta):
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
             self.button_states.clear()
+            # terminate() only *requests* a stop on the event bus; block any
+            # further scanning first so background_update can't re-attach the
+            # IRQ (which outlives the app) before the scheduler stops us.
+            self._exiting = True
             self._detach()
             self.minimise()
             self.terminate()
+            return True
+        if self._dirty:
+            self._send_state()
         return True
 
     def background_update(self, delta):
+        if self._exiting:
+            return
+        if self._dirty:
+            self._send_state()
         if self.config is None:
             now = time.ticks_ms()
             if time.ticks_diff(now, self._last_scan) > 2000:

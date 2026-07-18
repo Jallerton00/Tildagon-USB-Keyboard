@@ -37,6 +37,15 @@ mpremote cp usb/device/*.py :/apps/usb_keyboard/usb/device/
 mpremote reset
 ```
 
+**If the app is already installed from the app store**, the launcher runs the
+store copy, not `/apps/usb_keyboard/` — deploy updates over the store install
+instead (or the badge will keep running the old code):
+
+```sh
+mpremote cp app.py :/apps/Jallerton00_Tildagon_USB_Keyboard/app.py
+mpremote reset
+```
+
 ## Use
 
 1. Plug the keyboard hexpansion into any port.
