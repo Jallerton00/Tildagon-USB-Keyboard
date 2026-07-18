@@ -1,0 +1,18 @@
+[app]
+# The name of your app as displayed in the menu
+name = "USB Keyboard"
+
+# The submenu where your app should appear.
+# One of: "Badge", "Music", "Media", "Apps", "Games", "Background"
+category = "Apps"
+
+[entry]
+# The name of your entry point `Application` class
+class = "USBKeyboardApp"
+
+[metadata]
+author = "James A"
+license = "MIT"
+url = "https://github.com/Jallerton00/Tildagon-USB-Keyboard"
+description = "Turns the KeebDeck keyboard hexpansion into a USB HID keyboard for your computer"
+version = "0.1.0"
